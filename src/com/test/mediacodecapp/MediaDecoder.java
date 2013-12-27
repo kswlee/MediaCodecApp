@@ -3,9 +3,6 @@ package com.test.mediacodecapp;
 import java.nio.ByteBuffer;
 import java.util.Locale;
 
-import com.test.colorconverter.ColorConvertUtil;
-
-import android.graphics.Bitmap;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaExtractor;
@@ -16,20 +13,22 @@ import android.view.Surface;
 
 public class MediaDecoder {
 	public interface OnFrameAvailabkeListener {
-		public void onFrameAvailable(Bitmap bmp, long timestamp, int index);
+		public void onFrameAvailable(long timestamp, int index, boolean EOS);
 	};
 	
 	private MediaCodec mCodec;
 	private MediaExtractor mExtractor;
 	private String mFilePath;
 	private MediaFormat mFormat;
-	MediaCodecApp mContext;
-	MediaMetadataRetriever mRetriever = new MediaMetadataRetriever();
-	OnFrameAvailabkeListener mFrameListener = null;
+	private int mTrackIndex = 0;
+	private Surface mSurface = null;
+	private ByteBuffer [] mCodecInputBuffers;
+	private MediaMetadataRetriever mRetriever = new MediaMetadataRetriever();
+	private OnFrameAvailabkeListener mFrameListener = null;
 	
 	public MediaDecoder(String path, Surface surface, MediaCodecApp activity, OnFrameAvailabkeListener l) {
 		mFilePath = path;
-		
+		mSurface = surface;
 		mExtractor = new MediaExtractor( );
 		mExtractor.setDataSource( mFilePath );
 				
@@ -38,127 +37,134 @@ public class MediaDecoder {
 			MediaFormat mf = mExtractor.getTrackFormat(i);			
 			if (mf.getString(MediaFormat.KEY_MIME).toLowerCase(Locale.UK).contains("video")) {
 				mFormat = mExtractor.getTrackFormat(i);
+				mTrackIndex = i;
 				break;
 			}
 		}		
-		
-		mContext = activity;
+				 
 		mFrameListener = l;
-
 		mRetriever.setDataSource( mFilePath );				
 	}
-	
+		
 	public void decode() {
 		createDecoder();
 		
 		Thread t = new Thread(new Runnable() {
 			@Override
 			public void run() {
-				doDecode();
+				try {
+					doDecode();
+				} catch (Exception e) {
+					e.printStackTrace();
+				}
 			}			
 		}); t.start();
 	}
-	
-	private ByteBuffer [] mCodecInputBuffers;
-	private ByteBuffer [] mCodecOutputBuffers;
-	private void createDecoder( )
-	{		
-		mCodec = MediaCodec.createDecoderByType( "video/avc" );
-		mCodec.configure(mFormat, null, null, 0);
+		
+	private void createDecoder() {		
+		mCodec = MediaCodec.createDecoderByType( mFormat.getString(MediaFormat.KEY_MIME) );
+		mCodec.configure(mFormat, mSurface, null, 0);
+		mCodec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING);
 		mCodec.start( );
 		
-		mExtractor.selectTrack(0);
+		mExtractor.selectTrack(mTrackIndex);
 	}
 		
 	private void doDecode() {
 		mCodecInputBuffers = mCodec.getInputBuffers();
-		mCodecOutputBuffers = mCodec.getOutputBuffers();
 		
 		boolean sawInputEOS = false;
-		int frameIndex = 0;
+		long inputEOSPTS = -1;
+		long lastPTS = -1;
 		for (;;) {
-			long presentationTimeUs = 0;
-			int inputBufferIndex = mCodec.dequeueInputBuffer(-1);
-			if (inputBufferIndex >= 0) {				
-				ByteBuffer dstBuf = mCodecInputBuffers[ inputBufferIndex ];
-
-				int sampleSize = mExtractor.readSampleData( dstBuf, 0 );
-		        Log.d( "Sample Size", String.valueOf( sampleSize ) );
-		       
-		        if( sampleSize < 0 )
-		        {
-		            sawInputEOS = true;
-		            sampleSize = 0;		            
-		        }
-		        else
-		        {
-		            presentationTimeUs = mExtractor.getSampleTime( );
-		        }
-		        Log.d( "", "Input Buffer" );
-		        Log.d( "InputBufIndex:", String.valueOf( inputBufferIndex ) );
-		        Log.d( "PresentationTimeUS", String.valueOf( presentationTimeUs ) );
-		        		        
-		        mCodec.queueInputBuffer( inputBufferIndex, 0, // offset
-		                sampleSize, presentationTimeUs, sawInputEOS ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0 );
-		        
-		        if( !sawInputEOS )
-		        {
-		            Log.d( "Extractor", " Advancing" );
-		            mExtractor.advance( );
-
-		        } else {
-		        	break;
-		        }
+			MediaCodec.BufferInfo  info = new MediaCodec.BufferInfo ();
+			int outputBufferIndex = -1;
+			
+			// Queue Input buffer
+			for (;!sawInputEOS;) {
+				long presentationTimeUs = 0;
+				int inputBufferIndex = mCodec.dequeueInputBuffer(10000);
+				if (inputBufferIndex >= 0) {				
+					ByteBuffer dstBuf = mCodecInputBuffers[inputBufferIndex];
+	
+					int sampleSize = mExtractor.readSampleData(dstBuf, 0);			       			        
+			        presentationTimeUs = mExtractor.getSampleTime( );
+			        if (presentationTimeUs > 0)
+			        	lastPTS = presentationTimeUs;
+			        
+			        Log.d( "", "Input Buffer" );
+			        Log.d( "InputBufIndex:", String.valueOf( inputBufferIndex ) );
+			        Log.d( "PresentationTimeUS", String.valueOf( presentationTimeUs ) );
+			        lastPTS = presentationTimeUs;
+			        		        			        			       
+			        if (!sawInputEOS) {
+			            Log.d( "Extractor", " Advancing" );
+			            if (!mExtractor.advance()) {
+			            	Log.i("TAG", "Input EOS");
+			            	sawInputEOS = true;
+				            sampleSize = 0;		
+				            inputEOSPTS = lastPTS;
+			            }	
+			        }
+			        
+			        if (sampleSize > 0 || sawInputEOS)
+			        	mCodec.queueInputBuffer( inputBufferIndex, 0, // offset
+			                sampleSize, presentationTimeUs, sawInputEOS ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0 );
+			        else {
+			        	break;
+			        }
+			        
+			        
+			        outputBufferIndex = mCodec.dequeueOutputBuffer(info, 10000);
+			        if (outputBufferIndex >= 0) {
+			        	break;
+			        }
+				}
 			}
 					
 			// 
 			// handle output buffer 
-			//
-		    MediaCodec.BufferInfo  info = new MediaCodec.BufferInfo ();
-		    final int res = mCodec.dequeueOutputBuffer(info, 1000);
-		    if( res >= 0 )
-		    {
-		    	// boolean sawOutputEOS = false;
-		        int outputBufIndex = res;
-		        ByteBuffer buf = mCodecOutputBuffers[ outputBufIndex ];		                
-		        		        
-		        final byte[] chunk = new byte[ info.size ];
-		        buf.get( chunk ); // Read the buffer all at once		        
-		        buf.clear( ); // ** MUST DO!!! OTHERWISE THE NEXT TIME YOU GET THIS SAME BUFFER BAD THINGS WILL HAPPEN		        
-		        if( chunk.length > 0 )
-		        {
-		            Log.d( "Chunk: ", String.valueOf( chunk.length ) );
-		            final MediaFormat oformat = mCodec.getOutputFormat();
-		            int width = oformat.getInteger(MediaFormat.KEY_WIDTH);
-		            int height = oformat.getInteger(MediaFormat.KEY_HEIGHT);
-		            int colorFormat = oformat.getInteger(MediaFormat.KEY_COLOR_FORMAT);
-		            getColorFormat(oformat);
-		            
-		            ColorConvertUtil converter = new ColorConvertUtil();
-		            Bitmap bmp = converter.convertBufferAsRGB565(chunk, colorFormat, width, height);
-		            
-		            if (mFrameListener != null) {
-		            	mFrameListener.onFrameAvailable(bmp, presentationTimeUs, frameIndex++);
-		            }
-		        } 
-		                 		            		      
-		        mCodec.releaseOutputBuffer( outputBufIndex, true /* render */);
-
-		        if( ( info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM ) != 0 )
-		        {
-		        }
+			//		    		    
+		    if (outputBufferIndex < 0) {
+		    	outputBufferIndex = mCodec.dequeueOutputBuffer(info, 10000);
+		    	Log.i("TAG", "outputBufferIndex = " + outputBufferIndex);
 		    }
-		    else if( res == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED )
-		    {
-		    	mCodecOutputBuffers = mCodec.getOutputBuffers( );
-		    }
-		    else if( res == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED )
-		    {
+		    
+		    boolean isOutputEOS = (info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) > 0;
+		    Log.i("TAG", "info.presentationTimeUs = " + info.presentationTimeUs + " inputEOSPTS = " + inputEOSPTS);
+		    isOutputEOS |= (inputEOSPTS == info.presentationTimeUs);
+		    
+		    if (outputBufferIndex >= 0) {
+		    	if (mFrameListener != null) {
+	            	mFrameListener.onFrameAvailable(info.presentationTimeUs, outputBufferIndex, isOutputEOS);
+	            }
+		    } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED ) {
+		    	// No need to update output buffer, since we don't touch it
+		    } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED ) {
 		        final MediaFormat oformat = mCodec.getOutputFormat( );
 		        getColorFormat(oformat);
-		    }	
+		    }
+		    
+		    if (isOutputEOS) {
+		    	Log.i("TAG", "out EOS ");
+		    	break;
+		    }
 		}		
 	}
+	
+	public void render(int index) {
+		mCodec.releaseOutputBuffer(index, true);
+	}
+	
+	public void release() {
+		if (null != mExtractor)
+		mExtractor.release();
+		
+		if (null != mCodec) {
+			mCodec.stop();
+			mCodec.release();
+		}
+	}	
 	
 	private void getColorFormat(MediaFormat format) {
 		int colorFormat = format.getInteger(MediaFormat.KEY_COLOR_FORMAT);
